@@ -2,6 +2,8 @@
 
 **English** | [简体中文](README.zh-CN.md)
 
+<p align="center"><img src="screenshot.png" alt="AI Usage widget screenshot" width="362"></p>
+
 A macOS desktop widget for [Übersicht](https://tracesof.net/uebersicht/) that shows your
 **Claude Code** (and optionally **OpenAI Codex CLI**) usage at a glance — powered by local
 CLI tools (default: [`ccusage`](https://github.com/ryoppippi/ccusage), which reads the JSONL
