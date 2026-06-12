@@ -1,0 +1,6 @@
+{
+  "name": "ai-usage",
+  "description": "Shows Claude Code / Codex CLI usage with color-coded progress bars, reset countdown and a daily chart. All local via ccusage — no network requests, no credentials.",
+  "author": "BarryLiu",
+  "email": "ahandsomejunior@gmail.com"
+}
