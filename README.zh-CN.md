@@ -2,7 +2,7 @@
 
 [English](README.md) | **简体中文**
 
-<p align="center"><img src="preview.png" alt="AI Usage 组件截图" width="362"></p>
+<p align="center"><img src="screenshot.png" alt="AI Usage 组件截图" width="516"></p>
 
 一个 [Übersicht](https://tracesof.net/uebersicht/) 的 macOS 桌面小组件,一眼看到
 **Claude Code**(以及可选的 **OpenAI Codex CLI**)用量——数据来自本地 CLI
