@@ -42,6 +42,63 @@ function fillStyle(r) {
   };
 }
 
+// ---------- 活跃热力图(GitHub 风格)----------
+// 把升序日序列按「周」打包成列:每列 7 行(周日→周六),空位补 null。
+// 序列连续(脚本逐日补 0),按 周日对齐 的列下标定位,跨月/跨周都不会错位。
+function buildHeatmap(series, useTok) {
+  if (!series || !series.length) return [];
+  const cells = series.map((d) => ({
+    date: d.date,
+    val: useTok ? (d.tokens || 0) : (d.cost || 0),
+    day: d,
+  }));
+  const first = new Date(cells[0].date + "T00:00:00");
+  const sunday = new Date(first);
+  sunday.setDate(first.getDate() - first.getDay()); // 回退到所在周的周日
+  const cols = [];
+  cells.forEach((c) => {
+    const dt = new Date(c.date + "T00:00:00");
+    const ci = Math.floor(Math.round((dt - sunday) / 86400000) / 7);
+    const wd = dt.getDay();
+    if (!cols[ci]) cols[ci] = { cells: new Array(7).fill(null), label: "" };
+    cols[ci].cells[wd] = c;
+  });
+  for (let i = 0; i < cols.length; i++)
+    if (!cols[i]) cols[i] = { cells: new Array(7).fill(null), label: "" };
+  // 月份标签:每列首个有效日的月份若与上一列不同,则在该列顶部标注。
+  let prevM = -1;
+  cols.forEach((col) => {
+    const f = col.cells.find(Boolean);
+    if (f) {
+      const m = new Date(f.date + "T00:00:00").getMonth();
+      col.label = m !== prevM ? (m + 1) + "月" : "";
+      prevM = m;
+    }
+  });
+  return cols;
+}
+
+// 活跃度 → 透明度:返回一个映射函数。用「分位」而非「值/峰值」——
+// 即某天在所有「有用量日」里排第几,避免个别高峰把其余日子全压成浅色,
+// 让深浅分布更均匀、层次更细。空白日返回 null(走轨道色)。
+function makeHeatScale(series, useTok) {
+  const vals = (series || [])
+    .map((d) => (useTok ? d.tokens : d.cost) || 0)
+    .filter((v) => v > 0)
+    .sort((a, b) => a - b);
+  const n = vals.length;
+  return (val) => {
+    if (!(val > 0)) return null;
+    if (n <= 1) return 0.85;
+    // 二分求该值的秩(同值取平均秩),换算成 0~1 分位
+    let lo = 0, hi = n;
+    while (lo < hi) { const m = (lo + hi) >> 1; if (vals[m] < val) lo = m + 1; else hi = m; }
+    let hi2 = lo; while (hi2 < n && vals[hi2] === val) hi2++;
+    const pct = ((lo + hi2) / 2) / n;          // 0~1
+    return 0.14 + 0.86 * pct;                   // 透明度 0.14 → 1.0,层次更细
+  };
+}
+
 // 紧凑 token 数:1.2M / 850k
 function fmtTok(n) {
   if (!n) return "0";
@@ -62,6 +119,69 @@ function resetText(iso) {
   if (diff <= 0) return "重置 " + clk;
   const h = Math.floor(diff / 3600000), m = Math.floor((diff % 3600000) / 60000);
   return "重置 " + clk + " · 剩 " + (h > 0 ? h + "h" : "") + m + "m";
+}
+
+// 重置倒计时:"Xd Yh 后重置" / "Xh Ym 后重置" / "Ym 后重置"
+function resetCountdown(iso) {
+  if (!iso) return "—";
+  const r = new Date(iso).getTime();
+  if (isNaN(r)) return "—";
+  let diff = r - Date.now();
+  if (diff <= 0) return "即将重置";
+  const d = Math.floor(diff / 86400000); diff -= d * 86400000;
+  const h = Math.floor(diff / 3600000); diff -= h * 3600000;
+  const m = Math.floor(diff / 60000);
+  const s = d > 0 ? d + "d " + h + "h" : h > 0 ? h + "h " + m + "m" : m + "m";
+  return s + " 后重置";
+}
+
+// 重置的绝对时刻:当天显示 "HH:MM";次日 "明天 HH:MM";更远 "M/D HH:MM"
+function resetClock(iso) {
+  if (!iso) return "";
+  const r = new Date(iso);
+  if (isNaN(r.getTime())) return "";
+  const p = (n) => String(n).padStart(2, "0");
+  const hhmm = p(r.getHours()) + ":" + p(r.getMinutes());
+  const t0 = new Date(); t0.setHours(0, 0, 0, 0);
+  const rd = new Date(r); rd.setHours(0, 0, 0, 0);
+  const days = Math.round((rd.getTime() - t0.getTime()) / 86400000);
+  if (days <= 0) return hhmm;
+  if (days === 1) return "明天 " + hhmm;
+  return (r.getMonth() + 1) + "/" + r.getDate() + " " + hhmm;
+}
+
+// 周期已过时间比例(0~1):按窗口长度 hours 由「重置时刻」反推起点。
+// 主进度条对应会话窗口(默认 5h);用于绿色时间标记与「持续到重置」判断。
+function periodElapsed(iso, hours) {
+  if (!iso) return 0;
+  const reset = new Date(iso).getTime();
+  if (isNaN(reset)) return 0;
+  const total = hours * 3600000;
+  return Math.min(1, Math.max(0, (Date.now() - (reset - total)) / total));
+}
+// 窗口长度(小时)——仅用于绿色「已过时间」标记的横向定位;
+// 百分比与重置倒计时都来自官方 resets_at,不依赖这两个常量。
+// 官方接口只返回 resets_at(窗口结束),不返回窗口长度,故此处用 Claude 的固定窗口:
+const SESSION_HOURS = 5;       // 会话:5h 滚动窗口
+const WEEK_HOURS = 7 * 24;     // 每周:7 天
+
+// 每周窗口:以本地周一 00:00 为锚点(ccusage 无官方周重置,这里按自然周近似)。
+// 返回本周起点(周一)与下次重置(下周一)。
+function weekReset() {
+  const now = new Date();
+  const monday = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  monday.setDate(monday.getDate() - ((now.getDay() + 6) % 7)); // 周一=0…周日=6
+  const next = new Date(monday);
+  next.setDate(monday.getDate() + 7);
+  return { monday, resetISO: next.toISOString() };
+}
+
+// 本月已过时间比例(Codex 主条按自然月)
+function monthElapsed() {
+  const now = new Date();
+  const start = new Date(now.getFullYear(), now.getMonth(), 1).getTime();
+  const end = new Date(now.getFullYear(), now.getMonth() + 1, 1).getTime();
+  return Math.min(1, Math.max(0, (Date.now() - start) / (end - start)));
 }
 
 // ---------- 实际刷新时间 / “x 分钟前” ----------
@@ -153,29 +273,45 @@ function fmtDate(iso) {
   return p.length >= 3 ? +p[1] + "月" + +p[2] + "日" : iso;
 }
 
-// 用 DOM 直接填充明细(Übersicht 的 render 不走 hooks,悬停状态用 DOM 维护)
-function showDetail(panel, day, brand) {
+// 按需(重)播一段动画:先清掉再强制回流,保证复用元素也能重新触发。
+function playAnim(el, anim) {
+  if (!el) return;
+  el.style.animation = "none";
+  void el.offsetWidth;
+  el.style.animation = anim;
+}
+
+// 用 DOM 直接填充明细(Übersicht 的 render 不走 hooks,悬停状态用 DOM 维护)。
+// animate=true 时(悬停换日)淡入;初始渲染传 false,避免每次刷新都闪一下。
+function showDetail(panel, day, brand, animate) {
   if (!panel || !day) return;
   const head = panel.querySelector(".cdhd");
   if (head) {
     head.textContent =
       fmtDate(day.date) + ": $" + Number(day.cost || 0).toFixed(2) +
       " · " + fmtTok(day.tokens || 0) + " tokens";
+    if (animate) playAnim(head, "cdfade .26s ease both");
   }
   const box = panel.querySelector(".cdmodels");
-  if (!box) return;
+  if (!box) { syncDetailHeight(panel); return; }
   box.textContent = "";
   const models = day.models || [];
   if (!models.length) {
     const e = document.createElement("div");
     e.className = "cdempty";
     e.textContent = "无模型明细";
+    if (animate) e.style.animation = "cdfade .26s ease both";
     box.appendChild(e);
+    syncDetailHeight(panel);
     return;
   }
-  models.forEach((m) => {
+  models.forEach((m, i) => {
     const row = document.createElement("div");
     row.className = "cdrow";
+    if (animate) {                       // 逐行错开淡入
+      row.style.animation = "cdfade .26s ease both";
+      row.style.animationDelay = (i * 0.035) + "s";
+    }
     const tick = document.createElement("i");
     tick.className = "cdtick";
     tick.style.background = brand;
@@ -193,6 +329,13 @@ function showDetail(panel, day, brand) {
     row.appendChild(txt);
     box.appendChild(row);
   });
+  syncDetailHeight(panel);
+}
+
+// 明细行数变化会改变面板高度;若图表展开,让外层高度平滑跟随。
+function syncDetailHeight(panel) {
+  const chart = panel && panel.closest(".chartwrap");
+  if (chart && chart.classList.contains("open")) syncChartHeight(chart);
 }
 
 // 默认展示最近一个有用量的日子
@@ -202,7 +345,7 @@ function initDetail(node, series, brand) {
   for (let i = series.length - 1; i >= 0; i--) {
     if ((series[i].cost || 0) > 0) { day = series[i]; break; }
   }
-  showDetail(node, day || series[series.length - 1], brand);
+  showDetail(node, day || series[series.length - 1], brand, false);
 }
 
 // ---------- 柱状图:展开状态记忆 + 横向拖动滚动 ----------
@@ -215,16 +358,64 @@ function toggleChart(e, pid) {
   const open = chart.classList.toggle("open");
   head.classList.toggle("open", open);
   try { localStorage.setItem("ai-usage-chart-" + pid, open ? "1" : "0"); } catch (e2) {}
-  if (open) {
-    const sc = chart.querySelector(".chartscroll");
-    if (sc) requestAnimationFrame(() => { sc.scrollLeft = sc.scrollWidth; });
-  }
+  syncChartHeight(chart);
+  if (open) scrollActive(chart);
+}
+
+// 把外层高度精确同步到当前内容:展开取真实 scrollHeight(随视图/明细变化平滑过渡),
+// 收缩归 0。读 scrollHeight 会强制回流,拿到的是切换后(display 生效后)的真实高度。
+function syncChartHeight(chart) {
+  if (!chart) return;
+  chart.style.maxHeight = chart.classList.contains("open")
+    ? (chart.scrollHeight + 4) + "px"
+    : "0px";
+}
+
+// 滚到最新:按当前视图(柱状/热力)选对应的横向滚动容器。
+function scrollActive(chart) {
+  const mode = chart.getAttribute("data-mode") === "heat" ? "heat" : "bar";
+  const sc = chart.querySelector(mode === "heat" ? ".heatscroll" : ".chartscroll");
+  if (sc) requestAnimationFrame(() => { sc.scrollLeft = sc.scrollWidth; });
+}
+
+// 切换 柱状 / 热力 视图:换视图后高度会变,重新同步让外层平滑过渡,再滚到最新。
+function setChartMode(e, pid, mode) {
+  e.stopPropagation();
+  const chart = e.currentTarget.closest(".chartwrap");
+  if (!chart) return;
+  chart.setAttribute("data-mode", mode);
+  try { localStorage.setItem("ai-usage-chartmode-" + pid, mode); } catch (e2) {}
+  playAnim(chart.querySelector(mode === "heat" ? ".heatwrap" : ".chartscroll"), "viewfade .28s ease");
+  syncChartHeight(chart);
+  scrollActive(chart);
+}
+
+// 给横向滚动容器加「按住拖动」滚动(柱状图、热力图共用)。
+function initDragScroll(sc) {
+  if (!sc || sc.__dragInit) return;
+  sc.__dragInit = true;
+  sc.addEventListener("mousedown", (e) => {
+    e.stopPropagation();              // 不触发整窗拖动
+    const start = { x: e.clientX, sl: sc.scrollLeft };
+    const mv = (ev) => { sc.scrollLeft = start.sl - (ev.clientX - start.x); };
+    const up = () => {
+      document.removeEventListener("mousemove", mv);
+      document.removeEventListener("mouseup", up);
+      sc.classList.remove("grabbing");
+    };
+    document.addEventListener("mousemove", mv);
+    document.addEventListener("mouseup", up);
+    sc.classList.add("grabbing");
+    e.preventDefault();
+  });
 }
 
 function initChart(node, pid) {
   if (!node) return;
-  let open = false;
+  let open = false, mode = "bar";
   try { open = localStorage.getItem("ai-usage-chart-" + pid) === "1"; } catch (e) {}
+  try { mode = localStorage.getItem("ai-usage-chartmode-" + pid) || "bar"; } catch (e) {}
+  node.setAttribute("data-mode", mode === "heat" ? "heat" : "bar");
   const card = node.closest(".card");
   const head = card && card.querySelector(".sthd");
   if (open) {
@@ -232,27 +423,14 @@ function initChart(node, pid) {
     if (head) head.classList.add("open");
   }
 
-  const sc = node.querySelector(".chartscroll");
-  if (sc) {
-    requestAnimationFrame(() => { if (open) sc.scrollLeft = sc.scrollWidth; });
-    if (!sc.__dragInit) {
-      sc.__dragInit = true;
-      sc.addEventListener("mousedown", (e) => {
-        e.stopPropagation();          // 不触发整窗拖动
-        const start = { x: e.clientX, sl: sc.scrollLeft };
-        const mv = (ev) => { sc.scrollLeft = start.sl - (ev.clientX - start.x); };
-        const up = () => {
-          document.removeEventListener("mousemove", mv);
-          document.removeEventListener("mouseup", up);
-          sc.classList.remove("grabbing");
-        };
-        document.addEventListener("mousemove", mv);
-        document.addEventListener("mouseup", up);
-        sc.classList.add("grabbing");
-        e.preventDefault();
-      });
-    }
-  }
+  initDragScroll(node.querySelector(".chartscroll"));
+  initDragScroll(node.querySelector(".heatscroll"));
+  // 初始高度直接就位,关掉过渡避免每次刷新(整窗重渲染)都重播展开动画
+  const prevT = node.style.transition;
+  node.style.transition = "none";
+  syncChartHeight(node);
+  requestAnimationFrame(() => { node.style.transition = prevT || ""; });
+  if (open) scrollActive(node);
 }
 
 // ---------- 根样式 ----------
@@ -264,14 +442,14 @@ export const className = `
   /* 主题变量:浅色默认,夜间模式由系统 prefers-color-scheme 覆盖。
      强调色(橙/绿/红/黄/蓝)两种模式通用,不放进变量。 */
   --paper: #F2EDE2; --card: #FFFFFF; --ink: #111111; --muted: #9A9A9A;
-  --track: #F2EDE2; --barframe: #111111; --tick: #111111; --tickmini: rgba(0,0,0,0.25);
+  --track: #F2EDE2; --track2: rgba(0,0,0,0.10); --barframe: #111111; --tick: #111111; --tickmini: rgba(0,0,0,0.25);
   --line: rgba(0,0,0,0.10); --hover: rgba(0,0,0,0.08); --scroll: rgba(0,0,0,0.18);
   --shadow: rgba(0,0,0,0.18);
   color: var(--ink);
 
   @media (prefers-color-scheme: dark) {
     --paper: #1C1C1E; --card: #2C2C2E; --ink: #F5F5F7; --muted: #8E8E93;
-    --track: #3A3A3C; --barframe: rgba(255,255,255,0.12); --tick: #F5F5F7; --tickmini: rgba(255,255,255,0.28);
+    --track: #3A3A3C; --track2: rgba(255,255,255,0.16); --barframe: rgba(255,255,255,0.12); --tick: #F5F5F7; --tickmini: rgba(255,255,255,0.28);
     --line: rgba(255,255,255,0.12); --hover: rgba(255,255,255,0.10); --scroll: rgba(255,255,255,0.22);
     --shadow: rgba(0,0,0,0.55);
   }
@@ -323,10 +501,26 @@ export const className = `
   .mid .unit { font-size: 12px; font-weight: 600; color: var(--muted); margin-left: 6px; }
   .mid .pct { margin-left: auto; font-size: 22px; font-weight: 800; }
 
-  .bar { height: 20px; background: var(--barframe); border-radius: 10px; padding: 3px; box-sizing: border-box; }
-  .track { position: relative; height: 100%; background: var(--track); border-radius: 7px; overflow: hidden; }
-  .fill { position: absolute; left: 0; top: 0; height: 100%; border-radius: 7px; transition: width .4s ease; }
-  .tick { position: absolute; top: 2px; bottom: 2px; width: 2px; background: var(--tick); opacity: .9; }
+  /* 进度行:会话/每周共用。标题行(标题 + 使用率)+ 细条 + 绿色时间标记 + 重置行 */
+  .prow { margin-top: 11px; }
+  /* 标题行:标题与使用率同号(22px,强调色 = 原 .mid .pct) */
+  .prowhd { display: flex; align-items: flex-end; }
+  .prowhd .ptitle { font-size: 22px; font-weight: 800; line-height: 1; letter-spacing: .5px; }
+  .prowhd .ppct { margin-left: auto; font-size: 22px; font-weight: 800; line-height: 1; }
+  .pbar { margin: 9px 0 6px; }
+  .ptrack { position: relative; height: 8px; background: var(--track2); border-radius: 4px; }
+  .pused { position: absolute; left: 0; top: 0; height: 100%; min-width: 8px; border-radius: 4px;
+           transition: width .4s ease, background .3s ease; }
+  .ptick { position: absolute; top: 1px; bottom: 1px; width: 1.5px; border-radius: 1px;
+           background: var(--tickmini); }
+  /* 绿色时间标记:略高出轨道,外描一圈卡片色与已用段分离 */
+  .ppace { position: absolute; top: -2px; bottom: -2px; width: 3px; border-radius: 2px;
+           background: ${C.green}; box-shadow: 0 0 0 1.5px var(--card); transition: left .4s ease; }
+  /* 条下方文字:大小同 traffic 的「使用量」(.fval 11px);余量数值 / 重置文字用黑色 */
+  .plabels { display: flex; font-size: 11px; color: var(--muted); letter-spacing: .3px; }
+  .plabels .pleft b { color: var(--ink); font-weight: 400; }
+  .plabels .pright { margin-left: auto; color: var(--ink); }
+  .plabels .perr { color: ${C.red}; font-weight: 700; }
 
   .foot { margin-top: 6px; font-size: 9px; color: var(--muted); letter-spacing: .3px; }
   .foot.err { color: ${C.red}; font-weight: 700; }
@@ -351,9 +545,15 @@ export const className = `
                transition: transform .25s ease; }
   .sthd.open .arw { transform: rotate(90deg); }
 
-  /* 每日柱状图:外层折叠,内层横向拖动滚动 */
-  .chartwrap { max-height: 0; overflow: hidden; transition: max-height .35s ease; }
-  .chartwrap.open { max-height: 420px; margin-top: 6px; }
+  /* 每日柱状图:外层折叠,内层横向拖动滚动。
+     高度由 JS 按真实内容精确设置(syncChartHeight)——固定 max-height 会在收缩时
+     先空走一段再开始动,造成卡顿;精确高度则展开/收缩/切换标签都顺滑。 */
+  .chartwrap { max-height: 0; overflow: hidden;
+               transition: max-height .3s ease, margin-top .3s ease; }
+  .chartwrap.open { margin-top: 6px; }
+  /* 切换柱状/热力、悬停换日的淡入动画由 JS 按需触发(playAnim),
+     不挂在选择器上,避免每次 15 分钟整窗刷新都重播一遍。 */
+  @keyframes viewfade { from { opacity: 0; } to { opacity: 1; } }
   .chartscroll { overflow-x: auto; overflow-y: hidden; cursor: default; padding-bottom: 4px; }
   .chartscroll.grabbing { cursor: default; }
   .chartscroll::-webkit-scrollbar { height: 5px; }
@@ -369,6 +569,44 @@ export const className = `
   .chartcap { display: flex; justify-content: space-between; font-size: 9px;
               color: var(--muted); margin-top: 3px; letter-spacing: .3px; }
 
+  /* 视图切换:柱状 / 热力 */
+  .chartmode { display: flex; gap: 4px; margin-bottom: 7px; }
+  .cmbtn { font: inherit; font-size: 9px; font-weight: 700; letter-spacing: .5px;
+           color: var(--muted); background: var(--track); border: 0; border-radius: 6px;
+           padding: 3px 9px; cursor: pointer; transition: color .15s ease, background .15s ease; }
+  .cmbtn:hover { color: var(--ink); }
+  .chartwrap[data-mode="bar"]  .cmbtn[data-m="bar"],
+  .chartwrap[data-mode="heat"] .cmbtn[data-m="heat"] { color: var(--card); background: var(--ink); }
+  /* 按视图显示对应内容 */
+  .chartwrap[data-mode="bar"]  .heatwrap,
+  .chartwrap[data-mode="heat"] .chartscroll,
+  .chartwrap[data-mode="heat"] .chartcap { display: none; }
+
+  /* 活跃热力图(GitHub 风格):横向按周排列覆盖近一年,主题色 + 透明度表活跃度 */
+  .heatscroll { overflow-x: auto; overflow-y: hidden; cursor: default; padding-bottom: 4px; }
+  .heatscroll::-webkit-scrollbar { height: 5px; }
+  .heatscroll::-webkit-scrollbar-thumb { background: var(--scroll); border-radius: 3px; }
+  .heatscroll::-webkit-scrollbar-track { background: transparent; }
+  .heatgrid { width: max-content; }
+  .heatbody { display: flex; align-items: flex-start; }
+  /* 左侧星期列:横向滚动时 sticky 固定在左缘,背景遮住下方滚过的格子 */
+  .heatdays { position: sticky; left: 0; z-index: 2; background: var(--card);
+              display: flex; flex-direction: column; gap: 2px; width: 11px;
+              padding-right: 2px; flex: none; }
+  .heatdays span { height: 11px; font-size: 8px; line-height: 11px; color: var(--muted); }
+  .heatcols { display: flex; gap: 2px; }
+  .heatcol { display: flex; flex-direction: column; gap: 2px; }
+  .hcell { width: 11px; height: 11px; border-radius: 2.5px; background: var(--track);
+           transition: transform .1s ease, box-shadow .1s ease; }
+  .hcell.on { cursor: pointer; }
+  .hcell.on:hover { box-shadow: 0 0 0 1.5px var(--ink); }
+  /* 月份标签:置于网格下方,首格为 sticky 占位(对齐并遮挡左缘星期列宽 13px) */
+  .heatmonths { display: flex; margin-top: 4px; }
+  .heatmonths .hmspace { position: sticky; left: 0; z-index: 2; width: 13px; flex: none;
+                         background: var(--card); }
+  .heatmonths .hmlabel { width: 13px; flex: none; font-size: 8px; color: var(--muted);
+                         letter-spacing: 0; white-space: nowrap; overflow: visible; }
+
   /* 悬停明细面板 */
   .cdetail { margin-top: 8px; padding-top: 8px; border-top: 1px dashed var(--line); }
   .cdhd { font-size: 12px; font-weight: 800; color: var(--ink); margin-bottom: 7px; }
@@ -379,6 +617,9 @@ export const className = `
   .cdname { font-size: 12px; font-weight: 700; color: var(--ink); }
   .cdval { font-size: 11px; color: var(--muted); margin-top: 1px; }
   .cdempty { font-size: 10px; color: var(--muted); }
+  /* 悬停换日时明细行淡入+轻微上移(仅 hover 触发,JS 设置;每行错开 delay) */
+  @keyframes cdfade { from { opacity: 0; transform: translateY(5px); }
+                      to   { opacity: 1; transform: none; } }
   .cdtotal { margin-top: 9px; padding-top: 8px; border-top: 1px dashed var(--line);
              font-size: 11px; color: var(--muted); }
   .cdtotal b { color: var(--ink); font-weight: 800; }
@@ -428,18 +669,98 @@ const GptLogo = () => {
   );
 };
 
+// ---------- 进度行(标题 + 使用率 + 细条 + 时间标记 + 重置),会话/每周共用 ----------
+// 标题=原 .mid .num(28px),使用率=原 .mid .pct(22px,强调色),重置=traffic .fval(11px)
+const ProgRow = ({ tag, pct, color, elapsed, resetISO, ok, error }) => (
+  <div className="prow">
+    <div className="prowhd">
+      <span className="ptitle">{tag}</span>
+      {ok ? <span className="ppct" style={{ color }}>{pct}%</span> : null}
+    </div>
+    <div className="pbar">
+      <div className="ptrack">
+        <i className="ptick" style={{ left: "25%" }} />
+        <i className="ptick" style={{ left: "50%" }} />
+        <i className="ptick" style={{ left: "75%" }} />
+        <i className="pused" style={fillStyle(pct / 100)} />
+        <i className="ppace" style={{ left: Math.round(elapsed * 100) + "%" }} />
+      </div>
+    </div>
+    {ok
+      ? <div className="plabels">
+          <span className="pleft">余量 <b>{Math.max(0, 100 - pct)}%</b></span>
+          <span className="pright">{resetCountdown(resetISO)} · {resetClock(resetISO)}</span>
+        </div>
+      : <div className="plabels"><span className="perr">⚠ {error || "无数据"}</span></div>}
+  </div>
+);
+
 // ---------- 服务卡片 ----------
 const Card = ({ prov, brand, Logo, pid }) => {
   const ratio = Math.min(prov.ratio || 0, 1);
-  const a = accent(ratio);
-  const rt = resetText(prov.resetISO);
+  const usedPct = Math.round(ratio * 100);
   const useTok = prov.unit === "Mtok";
   const series = prov.series || [];
+  const isClaude = pid === "claude";
+  // 官方用量(归一化:{session,week,opus},Claude=oauth/usage,Codex=wham/usage)
+  const official = prov.usage || null;
+  const oSession = official && official.session;
+  const oWeek = official && official.week;
+  const oOpus = official && official.opus;
+
+  // —— 主条(会话 / 本月):官方优先,否则回退 ccusage —— //
+  let mainTag, mainPct, mainResetISO, mainElapsed, mainOk;
+  if (oSession) {
+    const wh = oSession.windowHours || SESSION_HOURS;
+    mainTag = wh <= 24 ? "会话" : "本周期";
+    mainPct = Math.round(oSession.pct);
+    mainResetISO = oSession.resetISO;
+    mainElapsed = periodElapsed(oSession.resetISO, wh);
+    mainOk = true;
+  } else if (isClaude) {
+    mainTag = "会话"; mainPct = usedPct; mainResetISO = prov.resetISO;
+    mainElapsed = periodElapsed(prov.resetISO, SESSION_HOURS); mainOk = prov.ok;
+  } else {
+    mainTag = "本月"; mainPct = usedPct; mainResetISO = prov.resetISO;
+    mainElapsed = monthElapsed(); mainOk = prov.ok;
+  }
+  const mainColor = accent(mainPct / 100);
+  const mainOnPace = mainPct / 100 <= mainElapsed + 0.02;
+
+  // —— 每周条:官方优先,否则本周一锚点累计 vs 配置周额度 —— //
+  const wk = (prov.stats && prov.stats.week) || null;
+  const weekLim = wk ? (useTok ? wk.limit_tokens : wk.limit_cost) || 0 : 0;
+  let weekShow = false, weekPct = 0, weekResetISO = "", weekElapsed = 0;
+  if (oWeek) {
+    weekShow = true; weekPct = Math.round(oWeek.pct); weekResetISO = oWeek.resetISO;
+    weekElapsed = periodElapsed(oWeek.resetISO, oWeek.windowHours || WEEK_HOURS);
+  } else if (weekLim > 0) {
+    const wr = weekReset();
+    let weekUsed = 0;
+    series.forEach((d) => {
+      if (new Date(d.date + "T00:00:00") >= wr.monday) weekUsed += (useTok ? d.tokens : d.cost) || 0;
+    });
+    weekShow = true; weekPct = Math.round(Math.min(weekUsed / weekLim, 1) * 100);
+    weekResetISO = wr.resetISO; weekElapsed = periodElapsed(wr.resetISO, WEEK_HOURS);
+  }
+  const weekOnPace = weekPct / 100 <= weekElapsed + 0.02;
+
+  // —— 每周 Opus 条(仅官方且非空,目前仅 Claude 可能有)—— //
+  const opShow = !!oOpus;
+  const opPct = opShow ? Math.round(oOpus.pct) : 0;
+  const opResetISO = opShow ? oOpus.resetISO : "";
+  const opElapsed = opShow ? periodElapsed(oOpus.resetISO, oOpus.windowHours || WEEK_HOURS) : 0;
+  const opOnPace = opPct / 100 <= opElapsed + 0.02;
+
   const maxV = Math.max(1, ...series.map((d) => (useTok ? d.tokens : d.cost)));
   const dayLim = useTok
     ? (prov.stats && prov.stats.today && prov.stats.today.limit_tokens) || 0
     : (prov.stats && prov.stats.today && prov.stats.today.limit_cost) || 0;
   const total30 = series.reduce((s, d) => s + (d.cost || 0), 0);
+  const heatSeries = (prov.heat && prov.heat.length) ? prov.heat : series; // 热力图:近一年
+  const heatOpacity = makeHeatScale(heatSeries, useTok);
+  const heatCols = buildHeatmap(heatSeries, useTok);
+  const heatWd = ["", "一", "", "三", "", "五", ""]; // 左侧仅标 一/三/五,对齐 GitHub
   return (
     <div className="card">
       <div className="ctop">
@@ -459,25 +780,29 @@ const Card = ({ prov, brand, Logo, pid }) => {
         </div>
         <span className="badge" style={{ background: brand }}>{prov.plan || prov.unit || "用量"}</span>
       </div>
-      <div className="mid">
-        <span className="num">{Number(prov.used || 0)}</span>
-        <span className="unit">/ {Number(prov.limit || 0)} {prov.unit}</span>
-        <span className="pct" style={{ color: a }}>{Math.round(ratio * 100)}%</span>
-      </div>
-      <div className="bar">
-        <div className="track">
-          <div className="fill" style={fillStyle(ratio)} />
-          <i className="tick" style={{ left: "25%" }} />
-          <i className="tick" style={{ left: "50%" }} />
-          <i className="tick" style={{ left: "75%" }} />
+      {!official && (
+        <div className="mid">
+          <span className="num">{Number(prov.used || 0)}</span>
+          <span className="unit">/ {Number(prov.limit || 0)} {prov.unit}</span>
+          <span className="pct" style={{ color: mainColor }}>{mainPct}%</span>
         </div>
-      </div>
-      {prov.ok
-        ? <div className="foot">
-            {rt || "本周期用量"}
-            {prov.alt ? " · " + prov.alt.used + " " + prov.alt.unit : ""}
-          </div>
-        : <div className="foot err">⚠ {prov.error || "无数据"}</div>}
+      )}
+      <ProgRow
+        tag={mainTag} pct={mainPct} color={mainColor} elapsed={mainElapsed}
+        onPace={mainOnPace} resetISO={mainResetISO} ok={mainOk} error={prov.error}
+      />
+      {weekShow && (
+        <ProgRow
+          tag="每周" pct={weekPct} color={accent(weekPct / 100)} elapsed={weekElapsed}
+          onPace={weekOnPace} resetISO={weekResetISO} ok={true}
+        />
+      )}
+      {opShow && (
+        <ProgRow
+          tag="每周 Opus" pct={opPct} color={accent(opPct / 100)} elapsed={opElapsed}
+          onPace={opOnPace} resetISO={opResetISO} ok={true}
+        />
+      )}
       {prov.stats && (
         <div className="stats">
           {["today", "week", "month"].map((k) => {
@@ -519,7 +844,11 @@ const Card = ({ prov, brand, Logo, pid }) => {
             <span>每日趋势 · {useTok ? "Mtok" : "USD"} · {series.length}天</span>
             <span className="arw">▸</span>
           </div>
-          <div className="chartwrap" ref={(n) => initChart(n, pid)}>
+          <div className="chartwrap" data-mode="bar" ref={(n) => initChart(n, pid)}>
+            <div className="chartmode" onMouseDown={(e) => e.stopPropagation()}>
+              <button className="cmbtn" data-m="bar" onClick={(e) => setChartMode(e, pid, "bar")}>柱状</button>
+              <button className="cmbtn" data-m="heat" onClick={(e) => setChartMode(e, pid, "heat")}>热力</button>
+            </div>
             <div className="chartscroll">
               <div className="chartbars">
                 {series.map((d) => {
@@ -532,13 +861,50 @@ const Card = ({ prov, brand, Logo, pid }) => {
                       key={d.date}
                       title={d.date.slice(5) + "  " + valStr}
                       onMouseEnter={(e) =>
-                        showDetail(e.currentTarget.closest(".chartblock").querySelector(".cdetail"), d, brand)
+                        showDetail(e.currentTarget.closest(".chartblock").querySelector(".cdetail"), d, brand, true)
                       }
                     >
                       <i style={{ height: Math.max(h, 0) + "%", ...barFill(val, dayLim) }} />
                     </div>
                   );
                 })}
+              </div>
+            </div>
+            <div className="heatwrap">
+              <div className="heatscroll">
+                <div className="heatgrid">
+                  <div className="heatbody">
+                    <div className="heatdays">
+                      {heatWd.map((w, i) => <span key={i}>{w}</span>)}
+                    </div>
+                    <div className="heatcols">
+                      {heatCols.map((col, ci) => (
+                        <div className="heatcol" key={ci}>
+                          {col.cells.map((c, wd) => {
+                            if (!c) return <i className="hcell" key={wd} />;
+                            const op = heatOpacity(c.val);
+                            const valStr = useTok ? fmtTok(c.val) : "$" + c.val.toFixed(1);
+                            return (
+                              <i
+                                className={"hcell" + (op != null ? " on" : "")}
+                                key={wd}
+                                style={op != null ? { background: brand, opacity: op } : undefined}
+                                title={c.date.slice(5) + "  " + valStr}
+                                onMouseEnter={(e) =>
+                                  showDetail(e.currentTarget.closest(".chartblock").querySelector(".cdetail"), c.day, brand, true)
+                                }
+                              />
+                            );
+                          })}
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                  <div className="heatmonths">
+                    <span className="hmspace" />
+                    {heatCols.map((col, i) => <span className="hmlabel" key={i}>{col.label}</span>)}
+                  </div>
+                </div>
               </div>
             </div>
             <div className="chartcap">

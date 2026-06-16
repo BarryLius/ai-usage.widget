@@ -15,7 +15,7 @@ import base64
 import json
 import os
 import subprocess
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 TIMEOUT = 120  # 首次 npx 下载可能较慢
 
@@ -108,6 +108,135 @@ def run_cmd(argv):
     if i > 0:
         out = out[i:]
     return json.loads(out)
+
+
+# ============================================================
+#  官方用量(与各家 settings/usage 页一致)
+#  统一归一化为:{session:{pct,resetISO,windowHours}, week:{…}, opus:{…}|None}
+#  · Claude → api.anthropic.com/api/oauth/usage(钥匙串 OAuth token)
+#  · Codex  → chatgpt.com/backend-api/wham/usage(~/.codex/auth.json token)
+#  都用 curl(接口对 Python urllib 的 TLS 指纹会直接断流)。失败回退缓存。
+# ============================================================
+USAGE_CACHE_TTL = 24 * 3600  # 实时取不到时,24 小时内的缓存仍可用
+
+
+def _cache_path(key):
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        ".usage-cache-%s.json" % key)
+
+
+def _epoch_to_iso(sec):
+    try:
+        return datetime.fromtimestamp(float(sec), timezone.utc).isoformat()
+    except Exception:
+        return None
+
+
+def _win(pct, reset_iso, hours):
+    if pct is None or not reset_iso:
+        return None
+    return {"pct": pct, "resetISO": reset_iso, "windowHours": hours}
+
+
+# 实时优先,成功写缓存;失败回退最近一次缓存(防止偶发限流/网络/token 刷新瞬间
+# 取不到数据,导致进度条回退到 ccusage 估算而显示离谱数值)。
+def cached_usage(key, live_fn):
+    try:
+        live = live_fn()
+    except Exception:
+        live = None
+    if live:
+        try:
+            with open(_cache_path(key), "w", encoding="utf-8") as f:
+                json.dump({"ts": int(datetime.now().timestamp()), "usage": live}, f)
+        except Exception:
+            pass
+        return live
+    try:
+        with open(_cache_path(key), encoding="utf-8") as f:
+            c = json.load(f)
+        if datetime.now().timestamp() - c.get("ts", 0) < USAGE_CACHE_TTL:
+            return c.get("usage")
+    except Exception:
+        pass
+    return None
+
+
+def _curl_json(url, headers):
+    argv = ["curl", "-s", "--max-time", "20", "-w", "\n%{http_code}"]
+    for h in headers:
+        argv += ["-H", h]
+    argv.append(url)
+    res = subprocess.run(argv, capture_output=True, text=True, timeout=25, env=SUBPROC_ENV)
+    body = res.stdout or ""
+    nl = body.rfind("\n")
+    if nl < 0 or body[nl + 1:].strip() != "200":
+        return None
+    return json.loads(body[:nl])
+
+
+# Claude:钥匙串里的 OAuth token → /api/oauth/usage。窗口长度接口不返回,用固定 5h/7d。
+def _claude_usage_live():
+    raw = subprocess.run(
+        ["security", "find-generic-password", "-s", "Claude Code-credentials", "-w"],
+        capture_output=True, text=True, timeout=10, env=SUBPROC_ENV,
+    ).stdout.strip()
+    if not raw:
+        return None
+    tok = (json.loads(raw).get("claudeAiOauth") or {}).get("accessToken")
+    if not tok:
+        return None
+    j = _curl_json("https://api.anthropic.com/api/oauth/usage", [
+        "Authorization: Bearer " + tok,
+        "anthropic-beta: oauth-2025-04-20",
+        "anthropic-version: 2023-06-01",
+        "User-Agent: claude-cli/1.0",
+    ])
+    if not j:
+        return None
+    fh = j.get("five_hour") or {}
+    sd = j.get("seven_day") or {}
+    op = j.get("seven_day_opus") or None
+    out = {
+        "session": _win(fh.get("utilization"), fh.get("resets_at"), 5),
+        "week": _win(sd.get("utilization"), sd.get("resets_at"), 7 * 24),
+        "opus": _win(op.get("utilization"), op.get("resets_at"), 7 * 24) if op else None,
+    }
+    return out if (out["session"] or out["week"]) else None
+
+
+# Codex:~/.codex/auth.json 的 access_token → wham/usage。窗口长度由接口给(limit_window_seconds)。
+def _codex_usage_live():
+    path = os.path.expanduser("~/.codex/auth.json")
+    with open(path, encoding="utf-8") as f:
+        toks = (json.load(f).get("tokens") or {})
+    tok = toks.get("access_token")
+    acc = toks.get("account_id")
+    if not tok:
+        return None
+    j = _curl_json("https://chatgpt.com/backend-api/wham/usage", [
+        "Authorization: Bearer " + tok,
+        "chatgpt-account-id: " + (acc or ""),
+        "originator: codex_cli_rs",
+        "User-Agent: codex_cli_rs/0.0",
+    ])
+    if not j:
+        return None
+    rl = j.get("rate_limit") or {}
+
+    def win(o):
+        if not o or o.get("used_percent") is None:
+            return None
+        secs = o.get("limit_window_seconds") or 0
+        return _win(o.get("used_percent"), _epoch_to_iso(o.get("reset_at")),
+                    (secs / 3600.0) if secs else 5)
+
+    out = {
+        "session": win(rl.get("primary_window")),
+        "week": win(rl.get("secondary_window")),
+        "opus": None,
+    }
+    return out if (out["session"] or out["week"]) else None
 
 
 # ---------- 通用取值工具(parser=paths 用) ----------
@@ -340,20 +469,26 @@ def fetch_stats(cfg):
         if month_start <= dt <= today:
             buckets["month"][0] += tokens; buckets["month"][1] += cost
 
-    # 逐日序列:从 month_start 到今天补齐每一天(空缺补 0),升序。
-    series = []
-    cur = month_start
-    while cur <= today:
-        iso = cur.isoformat()
-        rec = per_day.get(iso) or {"tokens": 0, "cost": 0.0, "models": []}
-        series.append({"date": iso, "tokens": int(rec["tokens"]),
-                       "cost": round(rec["cost"], 2), "models": rec.get("models") or []})
-        cur += timedelta(days=1)
+    # 逐日序列(柱状图用):从 month_start 到今天补齐每一天(空缺补 0),升序。
+    def build_series(start):
+        out = []
+        cur = start
+        while cur <= today:
+            iso = cur.isoformat()
+            rec = per_day.get(iso) or {"tokens": 0, "cost": 0.0, "models": []}
+            out.append({"date": iso, "tokens": int(rec["tokens"]),
+                        "cost": round(rec["cost"], 2), "models": rec.get("models") or []})
+            cur += timedelta(days=1)
+        return out
+
+    # 热力图用:近一年(365 天)逐日序列,空缺补 0。
+    year_start = today - timedelta(days=364)
 
     return {
         "buckets": {k: {"tokens": int(v[0]), "cost": round(v[1], 2)}
                     for k, v in buckets.items()},
-        "series": series,
+        "series": build_series(month_start),
+        "heat": build_series(year_start),
     }
 
 
@@ -410,6 +545,16 @@ def main():
             v["limit_cost"] = float(lim.get("cost", 0) or 0)
         out[name]["stats"] = buckets
         out[name]["series"] = s.get("series") or []
+        out[name]["heat"] = s.get("heat") or []
+    # 会话/每周改用各家官方接口(与 settings/usage 页一致)
+    if out.get("claude"):
+        u = cached_usage("claude", _claude_usage_live)
+        if u:
+            out["claude"]["usage"] = u
+    if out.get("chatgpt"):
+        u = cached_usage("chatgpt", _codex_usage_live)
+        if u:
+            out["chatgpt"]["usage"] = u
     print(json.dumps(out, ensure_ascii=False))
 
 
