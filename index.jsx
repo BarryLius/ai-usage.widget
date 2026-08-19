@@ -473,7 +473,8 @@ export const className = `
     transition: transform .2s ease, filter .15s ease;
   }
   .rfbtn:hover { filter: brightness(1.15); }
-  .rfbtn.spin { animation: rfspin .6s linear; }
+  /* 持续转,直到 markRefreshDone() 摘掉 class(见下方刷新逻辑),不是固定时长播一次 */
+  .rfbtn.spin { animation: rfspin .8s linear infinite; }
   @keyframes rfspin { from { transform: rotate(0); } to { transform: rotate(360deg); } }
 
   .head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 14px; }
@@ -511,8 +512,10 @@ export const className = `
   .ptrack { position: relative; height: 8px; background: var(--track2); border-radius: 4px; }
   .pused { position: absolute; left: 0; top: 0; height: 100%; min-width: 8px; border-radius: 4px;
            transition: width .4s ease, background .3s ease; }
+  /* 叠在已用段(.pused)之上:实色(--tick,浅色近黑/深色近白)+ 卡片色描边(同 .ppace 手法),
+     保证空轨道(浅灰底)和任意填充色(绿/黄/橙/红)上都清晰可辨 */
   .ptick { position: absolute; top: 1px; bottom: 1px; width: 1.5px; border-radius: 1px;
-           background: var(--tickmini); }
+           background: var(--tick); box-shadow: 0 0 0 1px var(--card); }
   /* 绿色时间标记:略高出轨道,外描一圈卡片色与已用段分离 */
   .ppace { position: absolute; top: -2px; bottom: -2px; width: 3px; border-radius: 2px;
            background: ${C.green}; box-shadow: 0 0 0 1.5px var(--card); transition: left .4s ease; }
@@ -583,7 +586,8 @@ export const className = `
   .chartwrap[data-mode="heat"] .chartcap { display: none; }
 
   /* 活跃热力图(GitHub 风格):横向按周排列覆盖近一年,主题色 + 透明度表活跃度 */
-  .heatscroll { overflow-x: auto; overflow-y: hidden; cursor: default; padding-bottom: 4px; }
+  /* padding-top 给悬浮描边(外扩 1.5px 的 box-shadow)留空间,否则最上一行被 overflow 裁掉 */
+  .heatscroll { overflow-x: auto; overflow-y: hidden; cursor: default; padding: 2px 0 4px; }
   .heatscroll::-webkit-scrollbar { height: 5px; }
   .heatscroll::-webkit-scrollbar-thumb { background: var(--scroll); border-radius: 3px; }
   .heatscroll::-webkit-scrollbar-track { background: transparent; }
@@ -679,10 +683,10 @@ const ProgRow = ({ tag, pct, color, elapsed, resetISO, ok, error }) => (
     </div>
     <div className="pbar">
       <div className="ptrack">
+        <i className="pused" style={fillStyle(pct / 100)} />
         <i className="ptick" style={{ left: "25%" }} />
         <i className="ptick" style={{ left: "50%" }} />
         <i className="ptick" style={{ left: "75%" }} />
-        <i className="pused" style={fillStyle(pct / 100)} />
         <i className="ppace" style={{ left: Math.round(elapsed * 100) + "%" }} />
       </div>
     </div>
@@ -706,7 +710,9 @@ const Card = ({ prov, brand, Logo, pid }) => {
   const official = prov.usage || null;
   const oSession = official && official.session;
   const oWeek = official && official.week;
-  const oOpus = official && official.opus;
+  // 模型维度的「每周」限额(现为 Fable,旧版为 Opus);按每周条规则逐条显示。
+  const oScoped = (official && official.scoped) ||
+    (official && official.opus ? [Object.assign({ name: "Opus" }, official.opus)] : []);
 
   // —— 主条(会话 / 本月):官方优先,否则回退 ccusage —— //
   let mainTag, mainPct, mainResetISO, mainElapsed, mainOk;
@@ -745,12 +751,18 @@ const Card = ({ prov, brand, Logo, pid }) => {
   }
   const weekOnPace = weekPct / 100 <= weekElapsed + 0.02;
 
-  // —— 每周 Opus 条(仅官方且非空,目前仅 Claude 可能有)—— //
-  const opShow = !!oOpus;
-  const opPct = opShow ? Math.round(oOpus.pct) : 0;
-  const opResetISO = opShow ? oOpus.resetISO : "";
-  const opElapsed = opShow ? periodElapsed(oOpus.resetISO, oOpus.windowHours || WEEK_HOURS) : 0;
-  const opOnPace = opPct / 100 <= opElapsed + 0.02;
+  // —— 模型维度「每周」条(现为 Fable,旧版 Opus;仅官方且非空,目前仅 Claude)—— //
+  // 用量为 0(四舍五入后 0%)的模型不显示,避免长期挂一条空条。
+  const scopedRows = oScoped
+    .map((s) => {
+      const pct = Math.round(s.pct);
+      const elapsed = periodElapsed(s.resetISO, s.windowHours || WEEK_HOURS);
+      return {
+        name: s.name, pct, elapsed, resetISO: s.resetISO,
+        onPace: pct / 100 <= elapsed + 0.02,
+      };
+    })
+    .filter((s) => s.pct > 0);
 
   const maxV = Math.max(1, ...series.map((d) => (useTok ? d.tokens : d.cost)));
   const dayLim = useTok
@@ -797,12 +809,13 @@ const Card = ({ prov, brand, Logo, pid }) => {
           onPace={weekOnPace} resetISO={weekResetISO} ok={true}
         />
       )}
-      {opShow && (
+      {scopedRows.map((s) => (
         <ProgRow
-          tag="每周 Opus" pct={opPct} color={accent(opPct / 100)} elapsed={opElapsed}
-          onPace={opOnPace} resetISO={opResetISO} ok={true}
+          key={s.name}
+          tag={"每周 " + s.name} pct={s.pct} color={accent(s.pct / 100)} elapsed={s.elapsed}
+          onPace={s.onPace} resetISO={s.resetISO} ok={true}
         />
-      )}
+      ))}
       {prov.stats && (
         <div className="stats">
           {["today", "week", "month"].map((k) => {
@@ -883,10 +896,11 @@ const Card = ({ prov, brand, Logo, pid }) => {
                           {col.cells.map((c, wd) => {
                             if (!c) return <i className="hcell" key={wd} />;
                             const op = heatOpacity(c.val);
+                            // 有日期的格子(含 0 用量)悬停都有描边框 + 提示,同 GitHub
                             const valStr = useTok ? fmtTok(c.val) : "$" + c.val.toFixed(1);
                             return (
                               <i
-                                className={"hcell" + (op != null ? " on" : "")}
+                                className="hcell on"
                                 key={wd}
                                 style={op != null ? { background: brand, opacity: op } : undefined}
                                 title={c.date.slice(5) + "  " + valStr}
@@ -925,6 +939,18 @@ const Card = ({ prov, brand, Logo, pid }) => {
   );
 };
 
+// 刷新按钮:转到「新数据真正到达」才停,不是播完一段固定动画就停。
+// window.__aiRefresh 桥接「点击那一刻」和「下一次 render 拿到新数据」两个时间点
+// (DOM 节点在两次 render 之间是复用的,见 initWrap 的 __dragInit 同款持久化写法)。
+function markRefreshDone() {
+  if (typeof window === "undefined") return;
+  const st = window.__aiRefresh;
+  if (!st || !st.pending) return;
+  st.pending = false;
+  if (st.timer) { clearTimeout(st.timer); st.timer = null; }
+  if (st.btn) st.btn.classList.remove("spin");
+}
+
 // ---------- 主渲染 ----------
 export const render = ({ output }) => {
   if (!output || !output.trim()) {
@@ -940,20 +966,27 @@ export const render = ({ output }) => {
     return <div className="loading">脚本错误：{data.fatal}</div>;
   }
 
+  // 脚本重跑一次,ts 就会变;跟点击时记的 ts0 不一样即视为刷新成功,摘掉转圈。
+  if (typeof window !== "undefined" && window.__aiRefresh &&
+      window.__aiRefresh.pending && data.ts !== window.__aiRefresh.ts0) {
+    markRefreshDone();
+  }
+
   const onRefresh = (e) => {
     e.stopPropagation();
     const btn = e.currentTarget;
+    if (typeof window !== "undefined") {
+      if (window.__aiRefresh && window.__aiRefresh.timer) clearTimeout(window.__aiRefresh.timer);
+      window.__aiRefresh = { pending: true, ts0: data.ts, btn };
+      // 兜底:命令真失败时(网络断/脚本报错反复)也别转到天荒地老,强制停转。
+      // 正常刷新实测约 20s,但网络/npx 解析耗时会波动,45s 留足余量,避免正常刷新被误判成"超时"。
+      window.__aiRefresh.timer = setTimeout(markRefreshDone, 45000);
+    }
     btn.classList.remove("spin");
     void btn.offsetWidth; // 强制重启动画
     btn.classList.add("spin");
-    // 立即更新时间(整体刷新需等脚本跑完,先让时间即时生效)
-    const wrap = btn.closest(".wrap");
-    if (wrap) {
-      const d = new Date();
-      const hhmm = ("0" + d.getHours()).slice(-2) + ":" + ("0" + d.getMinutes()).slice(-2);
-      const md = (d.getMonth() + 1) + "月" + d.getDate() + "日";
-      setSub(wrap.querySelector(".sub"), md, hhmm, Math.floor(Date.now() / 1000));
-    }
+    // 时间不在这里乐观更新——.sub 的 ref 每次 render 都会用 data.date/asOf/ts 重设,
+    // 脚本真跑完、拿到新数据时才会显示新时间;刷新失败/超时则维持上一次成功的时间。
     if (typeof run === "function") {
       run("osascript -e 'tell application \"Übersicht\" to refresh'").catch(() => {});
     }

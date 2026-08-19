@@ -44,7 +44,7 @@ NPX = "/opt/homebrew/bin/npx"
 CONFIG = {
     "claude": {
         "label": "Claude Code",
-        "plan": "Max $200",        # 右上角 badge 文字(手填,本地日志无此信息)
+        "plan": "Max $200",        # 回退值:动态识别失败时用(见 read_plan)
         "account_url": "https://claude.ai/settings/profile",  # 点账户名跳转
         "command": [NPX, "-y", "ccusage@latest", "blocks", "--active", "--json"],
         "parser": "ccusage_blocks",
@@ -71,7 +71,7 @@ CONFIG = {
     },
     "chatgpt": {
         "label": "Codex",
-        "plan": "Plus $20",
+        "plan": "Plus $20",        # 回退值:动态识别失败时用(见 read_plan)
         "account_url": "https://chatgpt.com/#settings/Account",  # 点账户名跳转
         # ccusage codex 没有 blocks 子命令(Codex 非 5h 滑窗),
         # 这里改用 monthly 输出本月累计。
@@ -196,11 +196,31 @@ def _claude_usage_live():
         return None
     fh = j.get("five_hour") or {}
     sd = j.get("seven_day") or {}
-    op = j.get("seven_day_opus") or None
+
+    # 模型维度的「每周」限额:新版接口放在 limits[] 里(group=weekly、
+    # kind=weekly_scoped,scope.model.display_name 给模型名,如 Fable);
+    # 旧版是顶层 seven_day_opus。两者都收下,归一化成带 name 的周窗口。
+    scoped = []
+    for lim in (j.get("limits") or []):
+        if lim.get("group") != "weekly" or lim.get("kind") != "weekly_scoped":
+            continue
+        nm = ((lim.get("scope") or {}).get("model") or {}).get("display_name")
+        w = _win(lim.get("percent"), lim.get("resets_at"), 7 * 24)
+        if nm and w:
+            w["name"] = nm
+            scoped.append(w)
+    op = j.get("seven_day_opus") or None       # 兼容旧版接口
+    if op and not any(s.get("name") == "Opus" for s in scoped):
+        w = _win(op.get("utilization"), op.get("resets_at"), 7 * 24)
+        if w:
+            w["name"] = "Opus"
+            scoped.append(w)
+
     out = {
         "session": _win(fh.get("utilization"), fh.get("resets_at"), 5),
         "week": _win(sd.get("utilization"), sd.get("resets_at"), 7 * 24),
-        "opus": _win(op.get("utilization"), op.get("resets_at"), 7 * 24) if op else None,
+        "opus": scoped[0] if scoped else None,   # 兼容旧字段(取第一条)
+        "scoped": scoped,
     }
     return out if (out["session"] or out["week"]) else None
 
@@ -447,19 +467,30 @@ def fetch_stats(cfg):
             continue
         tokens = int(to_num(d.get(tok_f, 0)) or 0)
         cost = float(to_num(d.get(cost_f, 0)) or 0)
-        models = []
-        for m in (d.get("modelBreakdowns") or []):
-            mtok = ((to_num(m.get("inputTokens", 0)) or 0)
-                    + (to_num(m.get("outputTokens", 0)) or 0)
-                    + (to_num(m.get("cacheCreationTokens", 0)) or 0))
+        def _mtok(mv):
+            t = ((to_num(mv.get("inputTokens", 0)) or 0)
+                 + (to_num(mv.get("outputTokens", 0)) or 0)
+                 + (to_num(mv.get("cacheCreationTokens", 0)) or 0))
             if ccr:
-                mtok += (to_num(m.get("cacheReadTokens", 0)) or 0)
-            mcost = float(to_num(m.get("cost", m.get("costUSD", 0))) or 0)
-            models.append({
-                "name": m.get("modelName") or "?",
-                "cost": round(mcost, 2),
-                "tokens": int(mtok),
-            })
+                t += (to_num(mv.get("cacheReadTokens", 0)) or 0)
+            return int(t)
+
+        models = []
+        mb = d.get("modelBreakdowns")
+        if isinstance(mb, list) and mb:
+            # Claude 形态:list[{modelName, cost, inputTokens, …}],单模型成本直接给。
+            for m in mb:
+                mcost = float(to_num(m.get("cost", m.get("costUSD", 0))) or 0)
+                models.append({"name": m.get("modelName") or "?",
+                               "cost": round(mcost, 2), "tokens": _mtok(m)})
+        elif isinstance(d.get("models"), dict):
+            # Codex 形态:dict{modelName: {inputTokens, …}},接口不给单模型成本,
+            # 按 token 占比把当日总成本(cost)摊到各模型,单模型时即等于当日全额。
+            tmp = [(nm, _mtok(mv or {})) for nm, mv in d["models"].items()]
+            tot = sum(t for _, t in tmp)
+            for nm, mtok in tmp:
+                mcost = (cost * mtok / tot) if tot > 0 else 0.0
+                models.append({"name": nm, "cost": round(mcost, 2), "tokens": mtok})
         models.sort(key=lambda x: x["cost"], reverse=True)
         per_day[dt.isoformat()] = {"tokens": tokens, "cost": cost, "models": models}
         if dt == today:
@@ -493,13 +524,17 @@ def fetch_stats(cfg):
 
 
 # ---------- 当前登录账户(本地配置,只读) ----------
-def _jwt_email(idt):
+def _jwt_claims(idt):
     try:
         seg = idt.split(".")[1]
         seg += "=" * (-len(seg) % 4)
-        return json.loads(base64.urlsafe_b64decode(seg)).get("email") or ""
+        return json.loads(base64.urlsafe_b64decode(seg))
     except Exception:
-        return ""
+        return {}
+
+
+def _jwt_email(idt):
+    return _jwt_claims(idt).get("email") or ""
 
 
 def read_account(name):
@@ -519,6 +554,70 @@ def read_account(name):
     return ""
 
 
+# ---------- 套餐 badge(本地凭据动态识别,取不到回退 CONFIG.plan) ----------
+# 档位由本地凭据给,$ 金额是套餐固有面价(接口不返回),按档位映射。
+_CLAUDE_PRICE = {"pro": "Pro $20", "max_5x": "Max $100", "max_20x": "Max $200"}
+_CODEX_PLAN = {
+    "free": "Free", "plus": "Plus $20", "pro": "Pro $200",
+    "team": "Team", "business": "Business", "enterprise": "Enterprise", "edu": "Edu",
+}
+
+
+def _claude_plan():
+    """从 rateLimitTier(如 default_claude_max_20x)识别档位;钥匙串优先,~/.claude.json 兜底。"""
+    sub = tier = ""
+    try:
+        raw = subprocess.run(
+            ["security", "find-generic-password", "-s", "Claude Code-credentials", "-w"],
+            capture_output=True, text=True, timeout=10, env=SUBPROC_ENV).stdout.strip()
+        o = (json.loads(raw).get("claudeAiOauth") or {})
+        sub = (o.get("subscriptionType") or "").lower()
+        tier = (o.get("rateLimitTier") or "").lower()
+    except Exception:
+        pass
+    if not tier:
+        try:
+            with open(os.path.expanduser("~/.claude.json"), encoding="utf-8") as f:
+                oa = (json.load(f).get("oauthAccount") or {})
+            tier = (oa.get("organizationRateLimitTier")
+                    or oa.get("userRateLimitTier") or "").lower()
+            if not sub:
+                sub = (oa.get("organizationType") or "").replace("claude_", "").lower()
+        except Exception:
+            pass
+    for k in ("max_20x", "max_5x"):          # 先匹配更具体的档位
+        if k in tier:
+            return _CLAUDE_PRICE[k]
+    if "pro" in tier or "pro" in sub:
+        return _CLAUDE_PRICE["pro"]
+    if "max" in tier or "max" in sub:        # 有 max 但没写倍率,给个通用值
+        return "Max"
+    return ""
+
+
+def _codex_plan():
+    """从 id_token 的 chatgpt_plan_type(plus/pro/free…)识别档位。"""
+    try:
+        with open(os.path.expanduser("~/.codex/auth.json"), encoding="utf-8") as f:
+            claims = _jwt_claims((json.load(f).get("tokens") or {}).get("id_token") or "")
+        auth = claims.get("https://api.openai.com/auth") or {}
+        pt = (auth.get("chatgpt_plan_type") or "").lower()
+        return _CODEX_PLAN.get(pt, pt.capitalize() if pt else "")
+    except Exception:
+        return ""
+
+
+def read_plan(name):
+    try:
+        if name == "claude":
+            return _claude_plan()
+        if name == "chatgpt":
+            return _codex_plan()
+    except Exception:
+        return ""
+    return ""
+
+
 def main():
     now = datetime.now()
     out = {"asOf": now.strftime("%H:%M"), "date": "%d月%d日" % (now.month, now.day),
@@ -526,7 +625,7 @@ def main():
     for name, cfg in CONFIG.items():
         r = provider_result(cfg)
         r["label"] = cfg.get("label", name)
-        r["plan"] = cfg.get("plan", "")
+        r["plan"] = read_plan(name) or cfg.get("plan", "")   # 动态识别,失败回退写死值
         r["account"] = read_account(name)
         r["accountUrl"] = cfg.get("account_url", "")
         r["ts"] = int(datetime.now().timestamp())
